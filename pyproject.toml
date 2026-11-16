@@ -1,0 +1,20 @@
+[project]
+name = "kubectl-amtool"
+version = "0.1.0"
+description = "kubectl plugin that runs amtool inside an Alertmanager pod"
+requires-python = ">=3.10"
+dependencies = ["click>=8.1"]
+
+[dependency-groups]
+dev = ["pytest"]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+# the plugin script has no .py extension, so ruff wouldn't find it otherwise
+extend-include = ["kubectl-amtool"]

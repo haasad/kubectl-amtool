@@ -1,0 +1,2 @@
+#!/bin/sh
+KUBECTL_AMTOOL_COMPLETE=cobra exec kubectl-amtool "$@"

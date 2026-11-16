@@ -1,0 +1,459 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["click>=8.1"]
+# ///
+"""kubectl plugin: run amtool inside an Alertmanager found on the current cluster."""
+
+import contextlib
+import io
+import json
+import os
+import shutil
+import subprocess
+import sys
+from collections.abc import Sequence
+from dataclasses import dataclass, replace
+from typing import NamedTuple
+
+import click
+from click.shell_completion import ShellComplete
+
+DEFAULT_URL = "http://localhost:9093"
+OPENSHIFT_ADMIN = "system:admin"
+CONTAINER = "alertmanager"
+# Prometheus Operator: Alertmanager resource <name> runs as StatefulSet alertmanager-<name>
+ALERTMANAGER_RESOURCE = "alertmanagers.monitoring.coreos.com"
+STATEFULSET_PREFIX = "alertmanager-"
+
+
+class Alertmanager(NamedTuple):
+    """An operator-managed Alertmanager: an Alertmanager resource."""
+
+    namespace: str
+    name: str
+
+    def __str__(self) -> str:
+        return f"{self.namespace}\t{self.name}"
+
+    @property
+    def statefulset(self) -> str:
+        """The StatefulSet the operator runs this Alertmanager as."""
+        return STATEFULSET_PREFIX + self.name
+
+
+# Default when several Alertmanagers are found: the platform one on OpenShift,
+# the Project Syn one elsewhere
+OPENSHIFT_MAIN = Alertmanager("openshift-monitoring", "main")
+SYN_MONITORING = Alertmanager("syn-monitoring", "alertmanager-monitoring")
+
+# "\b" keeps click from re-wrapping the following paragraph
+EPILOG = """\
+Alertmanagers managed by the Prometheus Operator (Alertmanager resources)
+are auto-detected, within the namespace given with -n or across all
+namespaces; those scaled to 0 replicas are skipped. Exactly one match is
+used. With several matches the default is openshift-monitoring on OpenShift
+and syn-monitoring elsewhere; without a default you must narrow it down with
+-n, and with -a if a namespace has more than one.
+
+Plugin options must come before the amtool arguments: everything from the
+first non-option token on (or after --) is passed to amtool verbatim.
+Without amtool arguments, this help is shown.
+
+\b
+Examples:
+  kubectl amtool alert                           # auto-detected Alertmanager
+  kubectl amtool -n openshift-user-workload-monitoring silence query
+  kubectl amtool -n monitoring -a ops alert
+  kubectl amtool --context prod -n syn-monitoring alert
+  kubectl amtool silence import < silences.json  # stdin is forwarded
+  kubectl amtool -l
+  kubectl amtool -- -h                           # amtool's own help
+"""
+
+
+def in_namespace(namespace: str | None) -> str:
+    """Suffix for messages that may be scoped to a namespace."""
+    return f" in namespace '{namespace}'" if namespace else ""
+
+
+def resolve_alertmanager(namespace: str | None, name: str | None) -> Alertmanager | None:
+    """Return the Alertmanager selected with -n and -a, or None without -a."""
+    if not name:
+        return None
+    if not namespace:
+        raise click.UsageError("-a requires -n")
+    return Alertmanager(namespace, name)
+
+
+@dataclass(frozen=True)
+class Kubectl:
+    """Runs kubectl with the global flags (context, kubeconfig, impersonation)."""
+
+    context: str | None = None
+    kubeconfig: str | None = None
+    as_user: str | None = None
+
+    def command(self, *args: str) -> list[str]:
+        """Build a kubectl command line with the global flags in front of args."""
+        flags = [
+            f"--{flag}={value}"
+            for flag, value in (
+                ("context", self.context),
+                ("kubeconfig", self.kubeconfig),
+                ("as", self.as_user),
+            )
+            if value
+        ]
+        return ["kubectl", *flags, *args]
+
+    def run(self, *args: str, timeout: float | None = None) -> subprocess.CompletedProcess[str]:
+        """Run kubectl and capture its output as text."""
+        # check=False: callers inspect returncode and show kubectl's stderr themselves
+        return subprocess.run(
+            self.command(*args), capture_output=True, text=True, timeout=timeout, check=False
+        )
+
+    def run_json(self, *args: str, error: str) -> dict:
+        """Run kubectl and parse its JSON output; fail with `error` otherwise."""
+        proc = self.run(*args)
+        if proc.returncode != 0:
+            sys.stderr.write(proc.stderr)
+            raise click.ClickException(f"{error} (see kubectl error above)")
+        try:
+            return json.loads(proc.stdout)
+        except json.JSONDecodeError as exc:
+            raise click.ClickException(f"{error}: invalid JSON from kubectl: {exc}") from exc
+
+
+def is_openshift(kc: Kubectl) -> bool:
+    """Detect OpenShift by its config.openshift.io API group.
+
+    Pass a Kubectl without impersonation: the impersonation default depends
+    on the result. A failed lookup warns and assumes a non-OpenShift cluster.
+    """
+    proc = kc.run("api-resources", "--api-group=config.openshift.io", "-o", "name")
+    if proc.returncode != 0:
+        detail = proc.stderr.strip().splitlines()
+        click.echo(
+            "warning: OpenShift detection failed, assuming a non-OpenShift cluster"
+            + (f": {detail[-1]}" if detail else ""),
+            err=True,
+        )
+        return False
+    return bool(proc.stdout.strip())
+
+
+def impersonation(as_user: str | None, no_as: bool, openshift: bool) -> str | None:
+    """User to impersonate: --as wins, --no-as disables, system:admin on OpenShift."""
+    if as_user:
+        return as_user
+    if no_as or not openshift:
+        return None
+    return OPENSHIFT_ADMIN
+
+
+def find_alertmanagers(kc: Kubectl, namespace: str | None) -> list[Alertmanager]:
+    """List the Alertmanagers managed by the Prometheus Operator.
+
+    Reads the operator's Alertmanager resources, which is much cheaper than
+    listing every StatefulSet. Resource <name> runs as StatefulSet
+    alertmanager-<name> in the same namespace. Resources explicitly scaled to
+    0 replicas are skipped (no replicas field means the default of 1).
+
+    Searches all namespaces unless one is given. Note that -A is a flag of
+    `get`, not a global flag, so it must come after "get".
+    """
+    scope = ["-n", namespace] if namespace else ["-A"]
+    data = kc.run_json(
+        "get",
+        ALERTMANAGER_RESOURCE,
+        *scope,
+        "-o",
+        "json",
+        error=f"cannot list Alertmanager resources{in_namespace(namespace)} "
+        "(is the Prometheus Operator installed?)",
+    )
+    return [
+        Alertmanager(item["metadata"]["namespace"], item["metadata"]["name"])
+        for item in data.get("items", [])
+        if item.get("spec", {}).get("replicas") != 0
+    ]
+
+
+def choose_alertmanager(
+    alertmanagers: list[Alertmanager], openshift: bool, namespace: str | None
+) -> Alertmanager:
+    """Pick the Alertmanager to use from the detected ones, or fail with the candidates."""
+    if not alertmanagers:
+        raise click.ClickException(f"no Alertmanagers found{in_namespace(namespace)}")
+    if len(alertmanagers) == 1:
+        return alertmanagers[0]
+    default = OPENSHIFT_MAIN if openshift else SYN_MONITORING
+    if default in alertmanagers:
+        click.echo(
+            f"info: multiple Alertmanagers found, defaulting to {default.namespace} "
+            "(kubectl amtool -l lists all)",
+            err=True,
+        )
+        return default
+    hint = "select one with -a" if namespace else "select one with -n (and -a if needed)"
+    listing = "\n".join(f"  {alertmanager}" for alertmanager in alertmanagers)
+    raise click.ClickException(
+        f"multiple Alertmanagers found{in_namespace(namespace)}, {hint}:\n{listing}"
+    )
+
+
+def list_command(kc: Kubectl, namespace: str | None, name: str | None) -> list[str]:
+    """Build the `kubectl get alertmanagers` command line for -l.
+
+    Lists all namespaces, the -n namespace, or with -a just that resource.
+    kubectl's own table shows the names to use with -a plus replica and status
+    columns. Unlike auto-detection it also shows resources scaled to 0.
+    """
+    scope = ["-n", namespace] if namespace else ["-A"]
+    return kc.command("get", ALERTMANAGER_RESOURCE, *scope, *([name] if name else []))
+
+
+def exec_command(
+    kc: Kubectl, alertmanager: Alertmanager, url: str, amtool_args: Sequence[str], interactive: bool
+) -> list[str]:
+    """Build the `kubectl exec ... amtool` command line."""
+    return kc.command(
+        "-n",
+        alertmanager.namespace,
+        "exec",
+        *(["-i"] if interactive else []),
+        f"sts/{alertmanager.statefulset}",
+        "-c",
+        CONTAINER,
+        "--",
+        "amtool",
+        f"--alertmanager.url={url}",
+        *amtool_args,
+    )
+
+
+# --- shell completion ---------------------------------------------------------
+# kubectl (>= 1.26) completes `kubectl amtool ...` by running the executable
+# kubectl_complete-amtool, which calls this script with
+# KUBECTL_AMTOOL_COMPLETE=cobra. The output is one suggestion per line followed
+# by a cobra directive line (":4" = no file completion, ":0" = default).
+
+COBRA_DIRECTIVE_DEFAULT = 0
+COBRA_DIRECTIVE_NO_FILE_COMP = 4
+# Upper bound for the `kubectl exec ... amtool --completion-bash` call
+AMTOOL_COMPLETION_TIMEOUT = 10
+
+
+def completion_kubectl(params: dict) -> tuple[Kubectl, bool]:
+    """Kubectl and OpenShift flag from the connection options typed so far.
+
+    Raises when kubectl is missing; callers turn every error into "no suggestions".
+    """
+    if shutil.which("kubectl") is None:
+        raise click.ClickException("kubectl not found on PATH")
+    plain = Kubectl(context=params.get("context"), kubeconfig=params.get("kubeconfig"))
+    openshift = is_openshift(plain)
+    as_user = impersonation(params.get("as_user"), params.get("no_as", False), openshift)
+    return replace(plain, as_user=as_user), openshift
+
+
+def discover_for_completion(ctx: click.Context, namespace: str | None) -> list[Alertmanager]:
+    """find_alertmanagers() using the connection options typed so far; [] on any error."""
+    try:
+        kc, _ = completion_kubectl(ctx.params)
+        return find_alertmanagers(kc, namespace)
+    except Exception:  # noqa: BLE001 - completion must never fail loudly
+        return []
+
+
+def amtool_completions(params: dict, incomplete: str) -> list[str]:
+    """Ask amtool inside the selected Alertmanager pod for completions.
+
+    Uses amtool's built-in (kingpin) `--completion-bash` with the completed words
+    and filters the result by the current word here. amtool only completes when
+    every word it gets is valid: an empty or partly typed word ('', `q`, `--o`)
+    gives nothing or an error. A bare `--` as the last word lists the flags, so
+    that is sent instead of a partly typed flag.
+    The Alertmanager is selected exactly like a real run; [] on any error or ambiguity.
+    """
+    current = ["--"] if incomplete.startswith("-") else []
+    try:
+        kc, openshift = completion_kubectl(params)
+        namespace = params.get("namespace")
+        alertmanager = resolve_alertmanager(
+            namespace, params.get("alertmanager_name")
+        ) or choose_alertmanager(find_alertmanagers(kc, namespace), openshift, namespace)
+        proc = kc.run(
+            "-n",
+            alertmanager.namespace,
+            "exec",
+            f"sts/{alertmanager.statefulset}",
+            "-c",
+            CONTAINER,
+            "--",
+            "amtool",
+            "--completion-bash",
+            *params.get("amtool_args", ()),
+            *current,
+            timeout=AMTOOL_COMPLETION_TIMEOUT,
+        )
+    except Exception:  # noqa: BLE001 - completion must never fail loudly
+        return []
+    if proc.returncode != 0:
+        return []
+    return [word for word in proc.stdout.split() if word.startswith(incomplete)]
+
+
+def complete_namespace(ctx: click.Context, param: click.Parameter, incomplete: str) -> list[str]:
+    """Namespaces that contain an Alertmanager."""
+    alertmanagers = discover_for_completion(ctx, None)
+    return sorted({s.namespace for s in alertmanagers if s.namespace.startswith(incomplete)})
+
+
+def complete_alertmanager_name(
+    ctx: click.Context, param: click.Parameter, incomplete: str
+) -> list[str]:
+    """Alertmanager names in the -n namespace (nothing without -n)."""
+    namespace = ctx.params.get("namespace")
+    if not namespace:
+        return []
+    return sorted(
+        s.name for s in discover_for_completion(ctx, namespace) if s.name.startswith(incomplete)
+    )
+
+
+def complete_amtool_args(ctx: click.Context, param: click.Parameter, incomplete: str) -> list[str]:
+    """First amtool word (e.g. `kubectl amtool -n mon <TAB>`): ask amtool."""
+    return amtool_completions(ctx.params, incomplete)
+
+
+def parse_for_completion(args: list[str]) -> dict | None:
+    """Parameters of the completed words, or None if they don't parse."""
+    try:
+        ctx = cli.make_context("kubectl amtool", list(args), resilient_parsing=True)
+    except click.ClickException:
+        return None
+    return ctx.params
+
+
+def cobra_complete(argv: list[str]) -> None:
+    """Print completions for argv in kubectl's plugin completion format.
+
+    Plugin options are completed by click. Once amtool arguments have started,
+    amtool itself is asked; if it has no suggestions (e.g. for a file argument
+    like `silence import FILE`), the shell falls back to file names.
+    """
+    args, incomplete = (argv[:-1], argv[-1]) if argv else ([], "")
+    values: list[str] = []
+    # Swallow warnings and kubectl errors: stderr would garble the shell prompt
+    with contextlib.redirect_stderr(io.StringIO()):
+        params = parse_for_completion(args)
+        if params and params.get("amtool_args"):
+            # amtool's turn; click would wrongly offer plugin options after "-"
+            values = amtool_completions(params, incomplete)
+            no_file_comp = bool(values)
+        else:
+            with contextlib.suppress(Exception):
+                completer = ShellComplete(cli, {}, "kubectl amtool", "")
+                values = [item.value for item in completer.get_completions(args, incomplete)]
+            no_file_comp = True
+    for value in values:
+        click.echo(value)
+    directive = COBRA_DIRECTIVE_NO_FILE_COMP if no_file_comp else COBRA_DIRECTIVE_DEFAULT
+    click.echo(f":{directive}")
+
+
+@click.command(
+    context_settings={"allow_interspersed_args": False, "help_option_names": ["-h", "--help"]},
+    epilog=EPILOG,
+)
+@click.option(
+    "-l",
+    "--list",
+    "list_alertmanagers",
+    is_flag=True,
+    help="List the Alertmanagers (runs kubectl get alertmanagers) and exit.",
+)
+@click.option(
+    "-n",
+    "--namespace",
+    metavar="NAMESPACE",
+    shell_complete=complete_namespace,
+    help="Namespace of the Alertmanager.",
+)
+@click.option(
+    "-a",
+    "--alertmanager",
+    "alertmanager_name",
+    metavar="NAME",
+    shell_complete=complete_alertmanager_name,
+    help="Alertmanager resource name, only needed if the namespace has several "
+    "Alertmanagers (requires -n).",
+)
+@click.option(
+    "--as",
+    "as_user",
+    metavar="USER",
+    help="User to impersonate (default: system:admin on OpenShift, none otherwise).",
+)
+@click.option("--no-as", is_flag=True, help="Disable the default impersonation on OpenShift.")
+@click.option("--context", metavar="CTX", help="kubeconfig context to use.")
+@click.option("--kubeconfig", metavar="FILE", help="kubeconfig file to use.")
+@click.option(
+    "--url",
+    default=DEFAULT_URL,
+    show_default=True,
+    metavar="URL",
+    help="Alertmanager URL as seen from inside the pod.",
+)
+@click.argument(
+    "amtool_args", nargs=-1, type=click.UNPROCESSED, shell_complete=complete_amtool_args
+)
+@click.pass_context
+def cli(
+    ctx: click.Context,
+    list_alertmanagers: bool,
+    namespace: str | None,
+    alertmanager_name: str | None,
+    as_user: str | None,
+    no_as: bool,
+    context: str | None,
+    kubeconfig: str | None,
+    url: str,
+    amtool_args: tuple[str, ...],
+) -> None:
+    """Run amtool against an Alertmanager found on the current cluster."""
+    if not amtool_args and not list_alertmanagers:
+        # Nothing to run: show the plugin's help instead of amtool's (that is `-- -h`)
+        click.echo(ctx.get_help())
+        return
+    if as_user and no_as:
+        raise click.UsageError("--as and --no-as are mutually exclusive")
+    selected = resolve_alertmanager(namespace, alertmanager_name)
+
+    if shutil.which("kubectl") is None:
+        raise click.ClickException("kubectl not found on PATH")
+
+    plain = Kubectl(context=context, kubeconfig=kubeconfig)
+    openshift = is_openshift(plain)
+    kc = replace(plain, as_user=impersonation(as_user, no_as, openshift))
+
+    if list_alertmanagers:
+        cmd = list_command(kc, namespace, alertmanager_name)
+    else:
+        alertmanager = selected or choose_alertmanager(
+            find_alertmanagers(kc, namespace), openshift, namespace
+        )
+        cmd = exec_command(kc, alertmanager, url, amtool_args, interactive=not sys.stdin.isatty())
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os.execvp(cmd[0], cmd)
+
+
+if __name__ == "__main__":
+    if os.environ.get("KUBECTL_AMTOOL_COMPLETE") == "cobra":
+        cobra_complete(sys.argv[1:])
+    else:
+        cli(prog_name="kubectl amtool")
