@@ -1,8 +1,3 @@
-#!/usr/bin/env -S uv run --script
-# /// script
-# requires-python = ">=3.10"
-# dependencies = ["click>=8.1"]
-# ///
 """kubectl plugin: run amtool inside an Alertmanager found on the current cluster."""
 
 import contextlib
@@ -237,9 +232,9 @@ def exec_command(
 
 # --- shell completion ---------------------------------------------------------
 # kubectl (>= 1.26) completes `kubectl amtool ...` by running the executable
-# kubectl_complete-amtool, which calls this script with
-# KUBECTL_AMTOOL_COMPLETE=cobra. The output is one suggestion per line followed
-# by a cobra directive line (":4" = no file completion, ":0" = default).
+# kubectl_complete-amtool (the complete_main() entry point) with the words typed
+# so far. The output is one suggestion per line followed by a cobra directive
+# line (":4" = no file completion, ":0" = default).
 
 COBRA_DIRECTIVE_DEFAULT = 0
 COBRA_DIRECTIVE_NO_FILE_COMP = 4
@@ -462,8 +457,15 @@ def cli(
     os.execvp(cmd[0], cmd)
 
 
+def main() -> None:
+    """Entry point of the kubectl-amtool executable (the plugin)."""
+    cli(prog_name="kubectl amtool")
+
+
+def complete_main() -> None:
+    """Entry point of the kubectl_complete-amtool executable (shell completion)."""
+    cobra_complete(sys.argv[1:])
+
+
 if __name__ == "__main__":
-    if os.environ.get("KUBECTL_AMTOOL_COMPLETE") == "cobra":
-        cobra_complete(sys.argv[1:])
-    else:
-        cli(prog_name="kubectl amtool")
+    main()

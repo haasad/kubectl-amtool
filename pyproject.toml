@@ -2,19 +2,30 @@
 name = "kubectl-amtool"
 version = "0.1.0"
 description = "kubectl plugin that runs amtool inside an Alertmanager pod"
+readme = "README.md"
+license = "BSD-3-Clause"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 dependencies = ["click>=8.1"]
 
+[project.urls]
+Repository = "https://github.com/haasad/kubectl-amtool"
+
+# kubectl finds plugins as kubectl-<name> on PATH, and (since 1.26) completes
+# them with kubectl_complete-<name>
+[project.scripts]
+kubectl-amtool = "kubectl_amtool.cli:main"
+kubectl_complete-amtool = "kubectl_amtool.cli:complete_main"
+
+[build-system]
+requires = ["uv_build>=0.13.8,<0.14.0"]
+build-backend = "uv_build"
+
 [dependency-groups]
 dev = ["pytest"]
-
-[tool.uv]
-package = false
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 100
-# the plugin script has no .py extension, so ruff wouldn't find it otherwise
-extend-include = ["kubectl-amtool"]

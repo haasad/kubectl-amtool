@@ -1,18 +1,11 @@
-import importlib.machinery
-import importlib.util
 import json
 import subprocess
-from pathlib import Path
 
 import click
 import pytest
 from click.testing import CliRunner
 
-SCRIPT = Path(__file__).resolve().parent.parent / "kubectl-amtool"
-_loader = importlib.machinery.SourceFileLoader("kubectl_amtool", str(SCRIPT))
-_spec = importlib.util.spec_from_loader("kubectl_amtool", _loader)
-ka = importlib.util.module_from_spec(_spec)
-_loader.exec_module(ka)
+from kubectl_amtool import cli as ka
 
 MAIN = ka.Alertmanager("openshift-monitoring", "main")
 UW = ka.Alertmanager("openshift-user-workload-monitoring", "user-workload")
