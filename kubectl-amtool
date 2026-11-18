@@ -22,8 +22,8 @@ from click.shell_completion import ShellComplete
 DEFAULT_URL = "http://localhost:9093"
 OPENSHIFT_ADMIN = "system:admin"
 CONTAINER = "alertmanager"
-# Prometheus Operator: Alertmanager resource <name> runs as StatefulSet alertmanager-<name>
 ALERTMANAGER_RESOURCE = "alertmanagers.monitoring.coreos.com"
+# Prometheus Operator: Alertmanager resource <name> runs as StatefulSet alertmanager-<name>
 STATEFULSET_PREFIX = "alertmanager-"
 
 
@@ -42,8 +42,8 @@ class Alertmanager(NamedTuple):
         return STATEFULSET_PREFIX + self.name
 
 
-# Default when several Alertmanagers are found: the platform one on OpenShift,
-# the Project Syn one elsewhere
+# Default when several Alertmanagers are found: the platform one on managed
+# OpenShift, the managed Talos one elsewhere
 OPENSHIFT_MAIN = Alertmanager("openshift-monitoring", "main")
 SYN_MONITORING = Alertmanager("syn-monitoring", "alertmanager-monitoring")
 
@@ -53,8 +53,7 @@ Alertmanagers managed by the Prometheus Operator (Alertmanager resources)
 are auto-detected, within the namespace given with -n or across all
 namespaces; those scaled to 0 replicas are skipped. Exactly one match is
 used. With several matches the default is openshift-monitoring on OpenShift
-and syn-monitoring elsewhere; without a default you must narrow it down with
--n, and with -a if a namespace has more than one.
+and syn-monitoring elsewhere; if no default instance is detected you must select an instance namespace with -n, and an instance within that namespace with -a if the namespace has more than one instance.
 
 Plugin options must come before the amtool arguments: everything from the
 first non-option token on (or after --) is passed to amtool verbatim.
@@ -177,7 +176,7 @@ def find_alertmanagers(kc: Kubectl, namespace: str | None) -> list[Alertmanager]
     return [
         Alertmanager(item["metadata"]["namespace"], item["metadata"]["name"])
         for item in data.get("items", [])
-        if item.get("spec", {}).get("replicas") != 0
+        if item.get("spec", {}).get("replicas", 1) != 0
     ]
 
 
