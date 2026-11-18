@@ -87,11 +87,12 @@ def resolve_alertmanager(namespace: str | None, name: str | None) -> Alertmanage
 
 @dataclass(frozen=True)
 class Kubectl:
-    """Runs kubectl with the global flags (context, kubeconfig, impersonation)."""
+    """Runs kubectl with the global flags (context, kubeconfig, impersonation, timeout)."""
 
     context: str | None = None
     kubeconfig: str | None = None
     as_user: str | None = None
+    request_timeout: str | None = None  # kubectl duration, e.g. "5s"
 
     def command(self, *args: str) -> list[str]:
         """Build a kubectl command line with the global flags in front of args."""
@@ -101,6 +102,7 @@ class Kubectl:
                 ("context", self.context),
                 ("kubeconfig", self.kubeconfig),
                 ("as", self.as_user),
+                ("request-timeout", self.request_timeout),
             )
             if value
         ]
@@ -241,7 +243,12 @@ def exec_command(
 
 COBRA_DIRECTIVE_DEFAULT = 0
 COBRA_DIRECTIVE_NO_FILE_COMP = 4
-# Upper bound for the `kubectl exec ... amtool --completion-bash` call
+# kubectl's --request-timeout for every kubectl call made while completing, so an
+# unreachable or slow API server gives up quickly instead of hanging the TAB.
+COMPLETION_REQUEST_TIMEOUT = "5s"
+# Hard upper bound (seconds) for the `kubectl exec ... amtool --completion-bash`
+# process as a backstop: --request-timeout bounds API requests, not necessarily
+# the exec stream itself or things like a hanging credential plugin.
 AMTOOL_COMPLETION_TIMEOUT = 10
 
 
@@ -252,7 +259,11 @@ def completion_kubectl(params: dict) -> tuple[Kubectl, bool]:
     """
     if shutil.which("kubectl") is None:
         raise click.ClickException("kubectl not found on PATH")
-    plain = Kubectl(context=params.get("context"), kubeconfig=params.get("kubeconfig"))
+    plain = Kubectl(
+        context=params.get("context"),
+        kubeconfig=params.get("kubeconfig"),
+        request_timeout=COMPLETION_REQUEST_TIMEOUT,
+    )
     openshift = is_openshift(plain)
     as_user = impersonation(params.get("as_user"), params.get("no_as", False), openshift)
     return replace(plain, as_user=as_user), openshift

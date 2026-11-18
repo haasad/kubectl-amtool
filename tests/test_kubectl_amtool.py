@@ -612,6 +612,7 @@ def test_complete_amtool_args_exec_command(complete):
             "kubectl",
             "--context=prod",
             "--as=system:admin",
+            "--request-timeout=5s",
             "-n",
             "mon",
             "exec",
@@ -704,6 +705,19 @@ def test_complete_amtool_args_timeout_is_silent(complete, monkeypatch):
 
     lines, _ = complete(["silence", ""], slow)
     assert lines == [":0"]
+
+
+@pytest.mark.parametrize("argv", [["-n", ""], ["-n", "mon", "-a", ""], ["silence", ""]])
+def test_complete_kubectl_calls_use_request_timeout(complete, argv):
+    _, fake = complete(argv, FakeKubectl(True, ONE_ALERTMANAGER))
+    assert fake.calls
+    for call in fake.calls:
+        assert "--request-timeout=5s" in call
+
+
+def test_run_has_no_request_timeout(run):
+    _, execs = run(["alert"], FakeKubectl(True, ONE_ALERTMANAGER))
+    assert not any(a.startswith("--request-timeout") for a in execs[0])
 
 
 def test_complete_plugin_options_still_work_before_amtool_args(complete):
