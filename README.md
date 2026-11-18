@@ -5,19 +5,24 @@ inside an Alertmanager pod on the current cluster. It needs no local amtool, no
 port-forward and no URL.
 
 ## Requirements
-- [uv](https://docs.astral.sh/uv/): the script is a single-file uv script
-  (`#!/usr/bin/env -S uv run --script`). uv fetches Python and
-  [click](https://click.palletsprojects.com/) automatically; the first run needs
-  network access.
+- [uv](https://docs.astral.sh/uv/) (or another installer for Python tools, e.g. pipx)
 - `kubectl`
 - Alertmanagers managed by the [Prometheus Operator](https://prometheus-operator.dev/). Other installations aren't detected.
 
 ## Install
 ```bash
-cp kubectl-amtool kubectl_complete-amtool ~/.local/bin/   # any directory on $PATH; both executable
-kubectl plugin list                                       # should list kubectl-amtool
+uv tool install git+https://github.com/haasad/kubectl-amtool
+kubectl plugin list   # should list kubectl-amtool
 ```
-`kubectl_complete-amtool` is optional and only needed for shell completion.
+This installs two executables into uv's tool directory (usually
+`~/.local/bin`, which has to be on `PATH`; `uv tool update-shell` adds it):
+`kubectl-amtool`, the plugin, and `kubectl_complete-amtool`, which kubectl uses
+for shell completion. uv installs Python and
+[click](https://click.palletsprojects.com/) into an isolated environment.
+
+Pin a tag or branch with `git+https://github.com/haasad/kubectl-amtool@<ref>`.
+Update with `uv tool upgrade kubectl-amtool`, remove with
+`uv tool uninstall kubectl-amtool`.
 
 ## Usage
 ```
@@ -70,8 +75,9 @@ that have an Alertmanager, so you don't have to remember them.
 
 ## Shell completion
 With kubectl 1.26 or newer, `kubectl amtool <TAB>` is completed by
-`kubectl_complete-amtool` if it is on `PATH` next to the plugin. kubectl's own
-completion has to be enabled, e.g. `source <(kubectl completion bash)`.
+`kubectl_complete-amtool`, which the install puts on `PATH` next to the plugin.
+kubectl's own completion has to be enabled, e.g.
+`source <(kubectl completion bash)`.
 
 - `-n <TAB>` suggests only namespaces that contain an Alertmanager.
 - `-a <TAB>` suggests the Alertmanager names in the namespace given with `-n`
@@ -92,8 +98,13 @@ each TAB there. If a lookup fails, for example because you can't list
 Alertmanager resources or exec into the pod, or if the choice is ambiguous,
 nothing is suggested.
 
-## Tests
-pytest is a dev dependency managed with uv:
+## Development
+The code lives in `src/kubectl_amtool/cli.py`. uv installs the package in
+editable mode into `.venv`, together with the dev dependencies:
 ```bash
-uv run pytest        # creates .venv from uv.lock on first run
+uv run pytest                 # tests; creates .venv from uv.lock on first run
+uv run kubectl-amtool --help  # run the plugin from the checkout
+uv tool install -e .          # put the checkout's executables on PATH
 ```
+`uv tool install` from git resolves the dependencies itself and ignores
+`uv.lock`; the lock file only pins the development environment.
